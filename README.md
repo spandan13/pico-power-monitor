@@ -68,12 +68,6 @@ Pico 2W  ──HTTP──▶  Python Server  ──▶ Telegram Alerts
 * Manually simulate outages via Pico HTTP UI
 * Simulated outages excluded from real stats
 
-### 📡 Network-Aware Monitoring
-
-* Handles transient network failures
-* Prevents alert spam using debounce logic
-* Optional latency tracking (recommended)
-
 ---
 
 ## 🔄 How It Works
