@@ -90,7 +90,7 @@ Pico 2W  ──HTTP──▶  Python Server  ──▶ Telegram Alerts
 
 ```
 .
-├── power_monitor.py      # Main server script
+├── power-monitor.py      # Main server script
 ├── config.ini           # Configuration (Ports, Telegram, etc.)
 ├── power_log.txt        # Event log
 └── README.md
@@ -150,10 +150,105 @@ Fill in:
 ### 3. Run
 
 ```bash
-python power_monitor.py
+python power-monitor.py
 ```
 
 ---
+
+## ⚙️ Running as a Service (systemd)
+
+To run the monitor automatically on boot, you can use a systemd service.
+
+The repository includes a ready-to-use service file:
+
+```text
+electricity-monitor.service
+```
+
+---
+
+### 🛠️ Configuration
+
+Before installing, edit the following lines inside the service file:
+
+```ini
+WorkingDirectory=/home/pi/electricity-monitor
+ExecStart=/home/pi/electricity-monitor/venv/bin/python power-monitor.py
+```
+
+Update them to match your setup:
+
+* `WorkingDirectory` → path where `power-monitor.py` is located
+* `ExecStart` → path to your Python binary
+
+Replace `ExecStart` with:
+
+```bash
+which python3
+```
+
+---
+
+### 👤 Update User
+
+Replace:
+
+```ini
+User=pi
+Group=pi
+```
+
+With your actual system username if different.
+
+---
+
+### 🚀 Installation
+
+Copy the service file and enable it:
+
+```bash
+sudo cp electricity-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable electricity-monitor   
+# start on boot
+sudo systemctl start electricity-monitor    
+# start immediately
+```
+
+---
+
+### 📜 Viewing Logs
+
+System logs are handled by journald.
+
+#### 🔴 Live logs (real-time)
+
+```bash
+journalctl -u electricity-monitor -f
+```
+
+#### 📄 Last 200 lines
+
+```bash
+journalctl -u electricity-monitor -n 200
+```
+
+---
+
+### 🧰 Useful Commands
+
+```bash
+sudo systemctl status electricity-monitor    
+# check service status
+sudo systemctl restart electricity-monitor   
+# restart service
+sudo systemctl stop electricity-monitor      
+# stop service
+sudo systemctl disable electricity-monitor   
+# disable auto-start
+```
+
+This ensures your power monitoring system runs continuously and reliably in the background.
 
 ## 🌐 Dashboard
 
