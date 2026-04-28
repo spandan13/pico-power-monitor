@@ -2,15 +2,23 @@
 
 A reliable (and overkill) power outage monitoring system built using a **Raspberry Pi Pico 2W** and a Python backend.
 
-Designed to answer a simple question:
-
-> *“Is the power actually gone — or is my network just being annoying again?”*
-
 ---
 
 ## 🧠 Overview
 
 This project monitors power uptime by using a WiFi-enabled microcontroller as an edge probe and a server-side polling system for analysis, alerting, and visualization.
+
+---
+## Screenshots
+
+### Dashboard
+![Dashboard Screenshot](https://i.snipboard.io/0e13mn.jpg)
+
+### Statistics
+![Dashboard Screenshot](https://i.snipboard.io/VADOf2.jpg)
+
+### Telegram Notifications
+![Dashboard Screenshot](https://i.snipboard.io/mrTu8g.jpg)
 
 ---
 
@@ -92,6 +100,33 @@ Pico 2W  ──HTTP──▶  Python Server  ──▶ Telegram Alerts
 
 ## ⚙️ Setup
 
+### 📟 Pico Firmware (pi-pico-main.py)
+
+This file contains the MicroPython script that runs on the **Raspberry Pi Pico 2W** and exposes the HTTP endpoint used by the server.
+
+### 🛠️ Setup Instructions
+
+1. Rename the file:
+
+```bash
+pi-pico-main.py → main.py
+```
+
+2. Open the file and update the required configuration:
+
+   * WiFi SSID and password
+   * Server IP / endpoint (if applicable)
+
+3. Flash/upload the file to your Pico 2W:
+
+   * Use tools like **Thonny**, **mpremote**, or any MicroPython uploader
+   * Ensure the file is placed as `main.py` on the device
+
+4. Reboot the Pico
+
+---
+
+### Python Server Script
 ### 1. Install dependencies
 
 ```bash
