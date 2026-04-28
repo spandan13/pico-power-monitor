@@ -1,0 +1,27 @@
+[Unit]
+Description=Electricity Uptime Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# ── Edit these two paths to match your setup ──────────────────────────────────
+WorkingDirectory=/home/pi/electricity-monitor
+ExecStart=/home/pi/electricity-monitor/venv/bin/python power-monitor.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+User=pi
+Group=pi
+Restart=on-failure
+RestartSec=10
+
+# Stream stdout/stderr straight to journald (same output you see when running
+# the script manually — timestamps, log levels, everything).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=electricity-monitor
+
+# Give the network a moment to fully settle before we start polling the Pico
+ExecStartPre=/bin/sleep 5
+
+[Install]
+WantedBy=multi-user.target
