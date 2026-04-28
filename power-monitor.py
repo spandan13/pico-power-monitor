@@ -1,16 +1,14 @@
 """
 power_monitor.py
 ================
-Python 3 server that monitors a Raspberry Pi Pico 2W power status via HTTP polling,
-sends Telegram alerts, logs events to a text file, and serves a web dashboard.
+Python 3 server that monitors home electricity uptime via a Raspberry Pi Pico 2W
+(HTTP polling), sends Telegram alerts, logs outage events to a text file,
+and serves a web dashboard.
 
-Dependencies (install via pip):
+Dependencies:
     pip install requests python-telegram-bot==13.13 flask
 
-Usage:
-    python power_monitor.py
-
-Configuration: edit the CONFIG block below, or use config.ini.
+Configuration: config.ini  (see template comment below)
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,16 +25,14 @@ from datetime import datetime, timedelta
 
 import requests
 import telegram
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CONFIGURATION  (loaded from config.ini)
-#
-#  config.ini example:
+#  CONFIGURATION  (config.ini)
 #
 #  [pico]
-#  url            = http://192.168.1.42     ; Pico's IP (printed on its serial console)
-#  device_id      = pico_01
+#  url            = http://192.168.1.42
+#  device_id      = home_pico
 #
 #  [telegram]
 #  token          = YOUR_BOT_TOKEN
@@ -44,8 +40,8 @@ from flask import Flask, jsonify, render_template_string
 #
 #  [monitor]
 #  log_file       = power_log.txt
-#  poll_interval  = 5                       ; seconds between HTTP polls
-#  offline_timeout = 15                     ; seconds of no reply → declare offline
+#  poll_interval  = 5
+#  http_timeout   = 4
 #
 #  [web]
 #  host           = 0.0.0.0
@@ -59,26 +55,18 @@ if not _cfg.read("config.ini"):
     )
 
 CONFIG = {
-    # Pico HTTP
     "pico_url":         _cfg.get("pico",    "url").rstrip("/"),
     "device_id":        _cfg.get("pico",    "device_id"),
-
-    # Telegram
     "telegram_token":   _cfg.get("telegram", "token"),
     "telegram_chat_id": _cfg.get("telegram", "chat_id"),
-
-    # Monitor behaviour
-    "log_file":         _cfg.get("monitor",    "log_file",        fallback="power_log.txt"),
-    "poll_interval":    _cfg.getint("monitor", "poll_interval",   fallback=5),
-    "offline_timeout":  _cfg.getint("monitor", "offline_timeout", fallback=15),
-    "http_timeout":     _cfg.getint("monitor", "http_timeout",    fallback=4),
-
-    # Flask web server
+    "log_file":         _cfg.get("monitor",    "log_file",      fallback="power_log.txt"),
+    "poll_interval":    _cfg.getint("monitor", "poll_interval", fallback=5),
+    "http_timeout":     _cfg.getint("monitor", "http_timeout",  fallback=4),
     "web_host":         _cfg.get("web",    "host", fallback="0.0.0.0"),
     "web_port":         _cfg.getint("web", "port", fallback=8080),
 }
 
-DEVICE_ID = CONFIG["device_id"]
+DEVICE_ID       = CONFIG["device_id"]
 PICO_STATUS_URL = CONFIG["pico_url"] + "/status"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,22 +83,22 @@ log = logging.getLogger("monitor")
 #  STATE
 # ─────────────────────────────────────────────────────────────────────────────
 state = {
-    "current_status":   "unknown",  # "online" | "offline" | "unknown"
-    "last_seen":        0.0,        # epoch of last successful HTTP response
-    "offline_since":    None,       # epoch when outage started, or None
-    "is_simulated":     False,      # True when Pico reports manual override
-    "alert_sent":       False,      # True after "Power Lost" alert sent
-    "consecutive_fails": 0,         # failed poll count (for hysteresis)
+    "current_status":    "unknown",
+    "last_seen":         0.0,
+    "offline_since":     None,
+    "is_simulated":      False,
+    "alert_sent":        False,
+    "consecutive_fails": 0,
 }
-
 state_lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LOG FILE  (power_log.txt)
-#  Format per line:  TYPE|START_ISO|END_ISO|DURATION_SECONDS
-#  TYPE: REAL | SIMULATED
+#  LOG FILE
+#  Format: TYPE|START_ISO|END_ISO|DURATION_SECONDS
+#  TYPE  : REAL | SIMULATED
 # ─────────────────────────────────────────────────────────────────────────────
 LOG_FILE = CONFIG["log_file"]
+log_lock = threading.Lock()   # protect concurrent file reads/writes
 
 
 def append_log_entry(evt_type: str, start: float, end: float):
@@ -118,34 +106,82 @@ def append_log_entry(evt_type: str, start: float, end: float):
     start_s  = datetime.fromtimestamp(start).strftime("%Y-%m-%dT%H:%M:%S")
     end_s    = datetime.fromtimestamp(end).strftime("%Y-%m-%dT%H:%M:%S")
     line     = f"{evt_type}|{start_s}|{end_s}|{duration}\n"
-    with open(LOG_FILE, "a") as f:
-        f.write(line)
+    with log_lock:
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
     log.info(f"Logged: {line.strip()}")
 
 
 def parse_log_entries():
-    """Return list of dicts from the log file. Returns [] if missing."""
+    """Return list of dicts (newest-last). Each dict includes 'idx' = line number."""
     entries = []
     if not os.path.exists(LOG_FILE):
         return entries
-    with open(LOG_FILE) as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            parts = raw.split("|")
-            if len(parts) != 4:
-                continue
-            try:
-                entries.append({
-                    "type":     parts[0],
-                    "start":    datetime.fromisoformat(parts[1]),
-                    "end":      datetime.fromisoformat(parts[2]),
-                    "duration": int(parts[3]),
-                })
-            except Exception:
-                pass
+    with log_lock:
+        with open(LOG_FILE) as f:
+            lines = f.readlines()
+    for idx, raw in enumerate(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split("|")
+        if len(parts) != 4:
+            continue
+        try:
+            entries.append({
+                "idx":      idx,
+                "type":     parts[0],
+                "start":    datetime.fromisoformat(parts[1]),
+                "end":      datetime.fromisoformat(parts[2]),
+                "duration": int(parts[3]),
+            })
+        except Exception:
+            pass
     return entries
+
+
+def delete_log_entry_by_idx(line_idx: int) -> bool:
+    """Remove the line at line_idx (0-based) from the log file."""
+    if not os.path.exists(LOG_FILE):
+        return False
+    with log_lock:
+        with open(LOG_FILE) as f:
+            lines = f.readlines()
+        if line_idx < 0 or line_idx >= len(lines):
+            return False
+        del lines[line_idx]
+        with open(LOG_FILE, "w") as f:
+            f.writelines(lines)
+    log.info(f"Deleted log entry at line {line_idx}")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DURATION FORMATTING
+#  < 60 s    → "N seconds"
+#  < 3600 s  → "N minutes"
+#  >= 3600 s → "N hours"
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+    if seconds < 3600:
+        mins = round(seconds / 60, 1)
+        display = int(mins) if mins == int(mins) else mins
+        return f"{display} minute{'s' if display != 1 else ''}"
+    hrs = round(seconds / 3600, 2)
+    display = int(hrs) if hrs == int(hrs) else hrs
+    return f"{display} hour{'s' if display != 1 else ''}"
+
+
+def _duration_unit(seconds: int) -> dict:
+    """Return dict with normalised value and unit label for chart axes."""
+    if seconds < 60:
+        return {"value": seconds,                "unit": "seconds"}
+    if seconds < 3600:
+        return {"value": round(seconds / 60, 1), "unit": "minutes"}
+    return     {"value": round(seconds / 3600, 2), "unit": "hours"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,13 +202,6 @@ def _total_seconds(entries, since: datetime, until: datetime) -> int:
     return total
 
 
-def _fmt_duration(seconds: int) -> str:
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h}h {m:02d}m {s:02d}s"
-
-
 def daily_stats(entries):
     now   = datetime.now()
     since = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -190,26 +219,37 @@ def weekly_stats(entries):
 
 
 def monthly_stats(entries):
-    now   = datetime.now()
-    since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    secs  = _total_seconds(_filter_real(entries), since, now)
+    now    = datetime.now()
+    since  = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    secs   = _total_seconds(_filter_real(entries), since, now)
     window = (now - since).total_seconds()
     return {"seconds": secs, "human": _fmt_duration(secs),
             "percentage": round(secs / window * 100, 2) if window > 0 else 0}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CHART DATA
+#  CHART DATA  (each chart picks its own best unit based on its max bucket)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _normalise_series(raw_list: list, divisor: float) -> list:
+    return [round(v / divisor, 2) for v in raw_list]
+
+
+def _chart_unit_and_divisor(raw_real, raw_sim):
+    max_val  = max(max(raw_real, default=0), max(raw_sim, default=0))
+    ud       = _duration_unit(max_val)
+    divisor  = {"seconds": 1, "minutes": 60, "hours": 3600}[ud["unit"]]
+    return ud["unit"], divisor
+
+
 def chart_daily(entries):
-    now  = datetime.now()
-    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    real_b = [0] * 24
-    sim_b  = [0] * 24
+    now    = datetime.now()
+    day0   = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    raw_r  = [0] * 24
+    raw_s  = [0] * 24
     labels = [f"{h:02d}:00" for h in range(24)]
     for e in entries:
-        buckets = real_b if e["type"] == "REAL" else sim_b
+        buckets = raw_r if e["type"] == "REAL" else raw_s
         for h in range(24):
             bs = day0 + timedelta(hours=h)
             be = bs + timedelta(hours=1)
@@ -217,53 +257,73 @@ def chart_daily(entries):
             en = min(e["end"],   be)
             if en > s:
                 buckets[h] += int((en - s).total_seconds())
-    return {"labels": labels, "real": real_b, "simulated": sim_b}
+    unit, div = _chart_unit_and_divisor(raw_r, raw_s)
+    return {"labels": labels, "real": _normalise_series(raw_r, div),
+            "simulated": _normalise_series(raw_s, div), "unit": unit}
 
 
 def chart_weekly(entries):
     now    = datetime.now()
-    labels, real_b, sim_b = [], [], []
+    labels, raw_r, raw_s = [], [], []
     for d in range(6, -1, -1):
         ds = (now - timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
         de = ds + timedelta(days=1)
         labels.append(ds.strftime("%a %d"))
         r = s = 0
         for e in entries:
-            ov_s  = max(e["start"], ds)
-            ov_e  = min(e["end"],   de)
+            ov_s = max(e["start"], ds)
+            ov_e = min(e["end"],   de)
             if ov_e > ov_s:
                 dur = int((ov_e - ov_s).total_seconds())
-                if e["type"] == "REAL":
-                    r += dur
-                else:
-                    s += dur
-        real_b.append(r)
-        sim_b.append(s)
-    return {"labels": labels, "real": real_b, "simulated": sim_b}
+                if e["type"] == "REAL": r += dur
+                else:                   s += dur
+        raw_r.append(r)
+        raw_s.append(s)
+    unit, div = _chart_unit_and_divisor(raw_r, raw_s)
+    return {"labels": labels, "real": _normalise_series(raw_r, div),
+            "simulated": _normalise_series(raw_s, div), "unit": unit}
 
 
 def chart_monthly(entries):
     now     = datetime.now()
     month_s = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    labels, real_b, sim_b = [], [], []
+    labels, raw_r, raw_s = [], [], []
     day = month_s
     while day.month == now.month and day <= now:
-        next_day = day + timedelta(days=1)
+        nd = day + timedelta(days=1)
         labels.append(day.strftime("%-d"))
         r = s = 0
         for e in entries:
-            ov_s  = max(e["start"], day)
-            ov_e  = min(e["end"],   next_day)
+            ov_s = max(e["start"], day)
+            ov_e = min(e["end"],   nd)
             if ov_e > ov_s:
                 dur = int((ov_e - ov_s).total_seconds())
-                if e["type"] == "REAL":
-                    r += dur
-                else:
-                    s += dur
-        real_b.append(r)
-        sim_b.append(s)
-        day = next_day
-    return {"labels": labels, "real": real_b, "simulated": sim_b}
+                if e["type"] == "REAL": r += dur
+                else:                   s += dur
+        raw_r.append(r)
+        raw_s.append(s)
+        day = nd
+    unit, div = _chart_unit_and_divisor(raw_r, raw_s)
+    return {"labels": labels, "real": _normalise_series(raw_r, div),
+            "simulated": _normalise_series(raw_s, div), "unit": unit}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RECENT EVENTS  (last 6, newest first)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def recent_events(entries, n=6):
+    sorted_e = sorted(entries, key=lambda e: e["start"], reverse=True)
+    out = []
+    for e in sorted_e[:n]:
+        out.append({
+            "idx":      e["idx"],
+            "type":     e["type"],
+            "start":    e["start"].strftime("%H:%M  %d %b %Y"),
+            "end":      e["end"].strftime("%H:%M  %d %b %Y"),
+            "duration": _fmt_duration(e["duration"]),
+        })
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,7 +353,7 @@ def send_telegram(text: str):
             text       = text,
             parse_mode = telegram.ParseMode.HTML,
         )
-        log.info(f"Telegram sent: {text[:80]}")
+        log.info(f"Telegram sent: {text[:100]}")
     except Exception as e:
         log.warning(f"Telegram send failed: {e}")
 
@@ -305,16 +365,27 @@ def send_telegram(text: str):
 def handle_went_offline(simulated: bool):
     with state_lock:
         if state["offline_since"] is not None:
-            return                          # already tracking an outage
+            return
         state["offline_since"] = time.time()
         state["is_simulated"]  = simulated
         state["alert_sent"]    = False
 
-    tag = " [SIMULATED]" if simulated else ""
-    log.info(f"Power OFFLINE{tag}")
+    now_str = datetime.now().strftime("%H:%M on %d %b %Y")
 
-    if not simulated:
-        send_telegram("⚠️ <b>Power Lost</b>\nYour monitored device has gone offline.")
+    if simulated:
+        log.info("Electricity OFFLINE [SIMULATED]")
+        send_telegram(
+            "🔌 <b>Simulated Power Cut Active</b>\n"
+            f"A manual power-cut simulation was triggered at <b>{now_str}</b>.\n"
+            "The monitor will report <i>offline</i> until the simulation is cancelled."
+        )
+    else:
+        log.info("Electricity OFFLINE [REAL]")
+        send_telegram(
+            "⚠️ <b>Power Outage Detected</b>\n"
+            f"Electricity went offline at <b>{now_str}</b>.\n"
+            "You will be notified when power is restored."
+        )
 
 
 def handle_came_online():
@@ -330,61 +401,49 @@ def handle_came_online():
     now      = time.time()
     duration = int(now - offline_since)
 
-    # Ignore very short blips (transient HTTP failures during Pico WiFi reconnect)
     if duration < 10:
         log.info(f"Ignoring sub-10s offline→online transition ({duration}s)")
         return
 
     evt_type = "SIMULATED" if simulated else "REAL"
     append_log_entry(evt_type, offline_since, now)
+    now_str  = datetime.now().strftime("%H:%M on %d %b %Y")
 
     if simulated:
         log.info(f"Simulated outage ended ({_fmt_duration(duration)})")
+        send_telegram(
+            "✅ <b>Simulation Cancelled</b>\n"
+            f"Power-cut simulation ended at <b>{now_str}</b>.\n"
+            f"Simulated duration: <b>{_fmt_duration(duration)}</b>.\n"
+            "The monitor is now reporting live electricity status again."
+        )
         return
 
     entries   = parse_log_entries()
     day_stats = daily_stats(entries)
-
-    msg = (
+    send_telegram(
         "✅ <b>Power Restored</b>\n"
-        f"Downtime this session: <b>{_fmt_duration(duration)}</b>\n"
-        f"Total downtime today:  <b>{day_stats['human']}</b> ({day_stats['percentage']}%)"
+        f"Electricity came back at <b>{now_str}</b>.\n"
+        f"Outage duration: <b>{_fmt_duration(duration)}</b>\n"
+        f"Total downtime today: <b>{day_stats['human']}</b> ({day_stats['percentage']}%)"
     )
-    send_telegram(msg)
-    log.info(f"Power ONLINE – session downtime: {_fmt_duration(duration)}")
+    log.info(f"Electricity ONLINE – outage duration: {_fmt_duration(duration)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  HTTP POLL LOOP
-#  Replaces MQTT entirely.
-#
-#  The Pico exposes GET /status → plain-text "online" or "offline".
-#  We poll it every poll_interval seconds.
-#
-#  Transition logic:
-#    • Response body == "offline"  → simulated override active on the Pico
-#    • HTTP success + body "online" → device is up and running normally
-#    • Request exception / non-200  → device is unreachable (real outage)
-#
-#  Hysteresis: we require 3 consecutive failures before declaring offline
-#  to avoid false positives from momentary WiFi reconnects on the Pico.
 # ─────────────────────────────────────────────────────────────────────────────
-OFFLINE_HYSTERESIS = 3   # consecutive failures before flipping to offline
+OFFLINE_HYSTERESIS = 3
 
 
 def poll_pico():
-    """Single poll of the Pico /status endpoint. Returns ("online"|"offline"|"unreachable", simulated)."""
     try:
-        r = requests.get(
-            PICO_STATUS_URL,
-            timeout=CONFIG["http_timeout"],
-        )
+        r = requests.get(PICO_STATUS_URL, timeout=CONFIG["http_timeout"])
         if r.status_code == 200:
             body = r.text.strip().lower()
             if body == "offline":
-                return "offline", True      # Pico told us it's simulating offline
-            return "online", False          # Pico is up and happy
-        # Non-200 counts as unreachable
+                return "offline", True
+            return "online", False
         log.warning(f"Pico returned HTTP {r.status_code}")
         return "unreachable", False
     except requests.exceptions.Timeout:
@@ -399,10 +458,7 @@ def poll_pico():
 
 
 def poll_loop():
-    """Background thread: poll the Pico and drive state transitions."""
-    global state
     log.info(f"Poll loop started → {PICO_STATUS_URL} every {CONFIG['poll_interval']}s")
-
     while True:
         result, simulated = poll_pico()
         now = time.time()
@@ -412,37 +468,29 @@ def poll_loop():
             fails       = state["consecutive_fails"]
 
         if result == "online":
-            # ── Device replied "online" ──────────────────────────────────────
             with state_lock:
-                state["last_seen"]          = now
-                state["consecutive_fails"]  = 0
-                state["current_status"]     = "online"
-
+                state["last_seen"]         = now
+                state["consecutive_fails"] = 0
+                state["current_status"]    = "online"
             if prev_status != "online":
                 handle_came_online()
 
         elif result == "offline":
-            # ── Device replied "offline" (manual override on Pico) ───────────
             with state_lock:
-                state["last_seen"]         = now      # device IS reachable
+                state["last_seen"]         = now
                 state["consecutive_fails"] = 0
                 state["current_status"]    = "offline"
-
             if prev_status != "offline":
                 handle_went_offline(simulated=True)
 
         else:
-            # ── Unreachable ─────────────────────────────────────────────────
             new_fails = fails + 1
             with state_lock:
                 state["consecutive_fails"] = new_fails
-
             log.debug(f"Pico unreachable (fail #{new_fails})")
-
             if new_fails >= OFFLINE_HYSTERESIS:
                 with state_lock:
                     state["current_status"] = "offline"
-
                 if prev_status != "offline":
                     handle_went_offline(simulated=False)
 
@@ -459,7 +507,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Power Monitor — {{ device_id }}</title>
+  <title>Electricity Uptime Monitor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;700;800&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -483,59 +531,49 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   html, body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-    font-size: 14px;
-    min-height: 100vh;
-    padding: 1.5rem 1rem 3rem;
+    background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 14px;
+    min-height: 100vh; padding: 1.5rem 1rem 3rem;
   }
-
   .page { max-width: 960px; margin: 0 auto; }
 
   /* ── Header ── */
   header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 1rem;
-    margin-bottom: 2rem;
-    padding-bottom: 1.2rem;
-    border-bottom: 1px solid var(--border);
+    display: flex; align-items: flex-start; justify-content: space-between;
+    flex-wrap: wrap; gap: 1rem;
+    margin-bottom: 2rem; padding-bottom: 1.2rem; border-bottom: 1px solid var(--border);
   }
   .logo { font-size: 1.25rem; font-weight: 800; color: #e8f0fa; letter-spacing: -.02em; }
   .logo span { color: var(--accent); }
+  .header-badges { display: flex; flex-direction: column; gap: .35rem; margin-top: .15rem; }
   .pico-link {
-    font-family: var(--mono);
-    font-size: .72rem;
-    color: var(--accent);
-    text-decoration: none;
-    border: 1px solid var(--border2);
-    padding: .35rem .75rem;
-    border-radius: 6px;
-    transition: background .15s;
+    font-family: var(--mono); font-size: .72rem; color: var(--accent);
+    text-decoration: none; border: 1px solid var(--border2);
+    padding: .35rem .75rem; border-radius: 6px; transition: background .15s;
+    align-self: flex-start;
   }
   .pico-link:hover { background: rgba(56,189,248,.1); }
+  .transport-badge {
+    font-family: var(--mono); font-size: .62rem;
+    background: rgba(56,189,248,.08); color: var(--accent);
+    border: 1px solid rgba(56,189,248,.2); padding: .2rem .6rem; border-radius: 4px;
+    display: inline-block;
+  }
+  .refresh-badge {
+    font-family: var(--mono); font-size: .62rem; color: var(--muted);
+    border: 1px solid var(--border); padding: .2rem .5rem; border-radius: 4px;
+  }
 
   /* ── Status hero ── */
   .status-hero {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 1.6rem 1.8rem;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-    position: relative;
-    overflow: hidden;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 1.6rem 1.8rem;
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem;
+    position: relative; overflow: hidden;
   }
   .status-hero::before {
-    content: '';
-    position: absolute; inset: 0;
+    content: ''; position: absolute; inset: 0;
     background: radial-gradient(ellipse 60% 80% at 90% 50%, rgba(56,189,248,.04), transparent);
     pointer-events: none;
   }
@@ -547,38 +585,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .status-meta { font-family: var(--mono); font-size: .75rem; color: var(--muted); margin-top: .3rem; }
 
   .pulse { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
-  .pulse.online  { background: var(--green); box-shadow: 0 0 0 4px rgba(52,211,153,.18); animation: pulse-g 2s infinite; }
-  .pulse.offline { background: var(--red);   box-shadow: 0 0 0 4px rgba(248,113,113,.18); animation: pulse-r 2s infinite; }
+  .pulse.online  { background: var(--green); animation: pulse-g 2s infinite; }
+  .pulse.offline { background: var(--red);   animation: pulse-r 2s infinite; }
   .pulse.unknown { background: var(--muted); }
-
   @keyframes pulse-g {
     0%   { box-shadow: 0 0 0 0   rgba(52,211,153,.4); }
-    70%  { box-shadow: 0 0 0 8px rgba(52,211,153,0); }
-    100% { box-shadow: 0 0 0 0   rgba(52,211,153,0); }
+    70%  { box-shadow: 0 0 0 8px rgba(52,211,153,0);  }
+    100% { box-shadow: 0 0 0 0   rgba(52,211,153,0);  }
   }
   @keyframes pulse-r {
     0%   { box-shadow: 0 0 0 0   rgba(248,113,113,.4); }
-    70%  { box-shadow: 0 0 0 8px rgba(248,113,113,0); }
-    100% { box-shadow: 0 0 0 0   rgba(248,113,113,0); }
+    70%  { box-shadow: 0 0 0 8px rgba(248,113,113,0);  }
+    100% { box-shadow: 0 0 0 0   rgba(248,113,113,0);  }
   }
-
-  /* ── Stats grid ── */
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-  }
-  .stat-card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 1.2rem 1.4rem;
-  }
-  .stat-card .period { font-size: .62rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: .5rem; }
-  .stat-card .dur    { font-family: var(--mono); font-size: 1.1rem; font-weight: 600; color: #e8f0fa; margin-bottom: .25rem; }
-  .stat-card .pct    { font-size: .75rem; color: var(--muted); }
-  .stat-card .pct b  { color: var(--red); }
 
   /* ── Section heading ── */
   .section-head {
@@ -586,15 +605,55 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     color: var(--muted); margin-bottom: .8rem; margin-top: 1.8rem;
   }
 
+  /* ── Stats grid ── */
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem; margin-bottom: 1.5rem;
+  }
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.2rem 1.4rem; }
+  .stat-card .period { font-size: .62rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: .5rem; }
+  .stat-card .dur    { font-family: var(--mono); font-size: 1.1rem; font-weight: 600; color: #e8f0fa; margin-bottom: .25rem; }
+  .stat-card .pct    { font-size: .75rem; color: var(--muted); }
+  .stat-card .pct b  { color: var(--red); }
+
+  /* ── Timeline ── */
+  .timeline { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .tl-row {
+    display: grid;
+    grid-template-columns: 90px 1fr 1fr 110px 36px;
+    align-items: center; gap: .75rem;
+    padding: .75rem 1.2rem; border-bottom: 1px solid var(--border);
+    font-size: .78rem; transition: background .12s;
+  }
+  .tl-row:last-child { border-bottom: none; }
+  .tl-row:hover { background: rgba(255,255,255,.02); }
+  .tl-header {
+    font-size: .6rem; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--muted); background: rgba(0,0,0,.25); cursor: default;
+  }
+  .tl-badge {
+    display: inline-block; font-size: .6rem; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; padding: .18rem .5rem; border-radius: 4px;
+  }
+  .tl-badge.REAL      { background: rgba(248,113,113,.15); color: var(--red);   border: 1px solid rgba(248,113,113,.25); }
+  .tl-badge.SIMULATED { background: rgba(251,191,36,.12);  color: var(--amber); border: 1px solid rgba(251,191,36,.2); }
+  .tl-time { font-family: var(--mono); color: var(--text); font-size: .72rem; }
+  .tl-dur  { font-family: var(--mono); color: var(--muted); font-size: .72rem; }
+  .tl-del-btn {
+    background: none; border: 1px solid var(--border2); color: var(--muted);
+    border-radius: 5px; cursor: pointer; font-size: .75rem; padding: .2rem .45rem;
+    transition: all .15s; line-height: 1.4;
+  }
+  .tl-del-btn:hover { border-color: var(--red); color: var(--red); background: rgba(248,113,113,.08); }
+  .tl-empty { padding: 1.4rem 1.2rem; color: var(--muted); font-size: .8rem; font-style: italic; }
+
   /* ── Chart cards ── */
   .chart-card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 1.4rem 1.4rem 1.2rem;
-    margin-bottom: 1rem;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 1.4rem 1.4rem 1.2rem; margin-bottom: 1rem;
   }
   .chart-title { font-size: .78rem; font-weight: 600; color: #c8d6e8; margin-bottom: 1rem; }
+  .chart-unit  { font-size: .65rem; color: var(--muted); font-family: var(--mono); margin-left: .4rem; font-weight: 400; }
   .chart-wrap  { position: relative; height: 180px; }
 
   /* ── Legend ── */
@@ -605,22 +664,64 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .legend-dot.sim  { background: var(--amber); }
 
   /* ── Footer ── */
-  footer { margin-top: 2.5rem; text-align: center; font-size: .65rem; color: var(--muted); font-family: var(--mono); }
-
-  /* ── Refresh badge ── */
-  .refresh-badge {
-    font-family: var(--mono); font-size: .62rem; color: var(--muted);
-    border: 1px solid var(--border); padding: .2rem .5rem; border-radius: 4px;
+  footer {
+    margin-top: 2.5rem; padding-top: 1.2rem; border-top: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center; gap: .7rem;
+    font-size: .65rem; color: var(--muted); font-family: var(--mono); text-align: center;
   }
-
-  /* ── Connection method badge ── */
-  .transport-badge {
-    font-family: var(--mono); font-size: .62rem;
-    background: rgba(56,189,248,.08); color: var(--accent);
-    border: 1px solid rgba(56,189,248,.2); padding: .2rem .6rem; border-radius: 4px;
+  .test-tg-btn {
+    background: none; border: 1px solid var(--border2); color: var(--muted);
+    font-family: var(--mono); font-size: .68rem; padding: .35rem 1rem;
+    border-radius: 6px; cursor: pointer; transition: all .15s;
   }
+  .test-tg-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(56,189,248,.06); }
+  .test-tg-btn:disabled { opacity: .35; cursor: default; }
 
-  @media (max-width: 480px) {
+  /* ── Toast ── */
+  #toast {
+    position: fixed; bottom: 1.5rem; right: 1.5rem;
+    background: #1e2535; border: 1px solid var(--border2);
+    color: var(--text); font-family: var(--mono); font-size: .75rem;
+    padding: .6rem 1.1rem; border-radius: 8px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.5);
+    opacity: 0; transform: translateY(8px);
+    transition: opacity .25s, transform .25s;
+    pointer-events: none; z-index: 999; max-width: 280px;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+
+  /* ── Confirm Modal ── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7); z-index: 900;
+    align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--card); border: 1px solid var(--border2);
+    border-radius: var(--radius); padding: 2rem 1.8rem;
+    max-width: 400px; width: 92%;
+    box-shadow: 0 12px 50px rgba(0,0,0,.7);
+  }
+  .modal h3 { font-size: 1rem; color: #e8f0fa; margin-bottom: .65rem; }
+  .modal p  { font-size: .82rem; color: var(--muted); margin-bottom: 1.6rem; line-height: 1.6; }
+  .modal-actions { display: flex; gap: .65rem; justify-content: flex-end; }
+  .btn-cancel {
+    background: none; border: 1px solid var(--border2); color: var(--muted);
+    font-family: var(--sans); font-size: .82rem; padding: .45rem .95rem;
+    border-radius: 6px; cursor: pointer; transition: all .12s;
+  }
+  .btn-cancel:hover { border-color: var(--text); color: var(--text); }
+  .btn-delete {
+    background: rgba(248,113,113,.15); border: 1px solid rgba(248,113,113,.35);
+    color: var(--red); font-family: var(--sans); font-size: .82rem; font-weight: 700;
+    padding: .45rem .95rem; border-radius: 6px; cursor: pointer; transition: all .12s;
+  }
+  .btn-delete:hover { background: rgba(248,113,113,.28); }
+
+  @media (max-width: 600px) {
+    .tl-row { grid-template-columns: 80px 1fr 32px; }
+    .tl-col-end, .tl-col-dur { display: none; }
     .status-value { font-size: 1.4rem; }
     .chart-wrap   { height: 150px; }
   }
@@ -629,37 +730,65 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <body>
 <div class="page">
 
+  <!-- ── Header ── -->
   <header>
     <div>
-      <div class="logo">Power<span>Monitor</span></div>
-      <span class="transport-badge" style="margin-top:.35rem;display:inline-block">HTTP polling · {{ poll_interval }}s</span>
+      <div class="logo">Electricity<span>Monitor</span></div>
+      <div class="header-badges">
+        <span class="transport-badge">HTTP polling · {{ poll_interval }}s</span>
+      </div>
     </div>
     <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
       <span class="refresh-badge" id="refresh-counter">refreshing in 10s</span>
-      <a class="pico-link" href="{{ pico_url }}" target="_blank">&#8599; Pico Management</a>
+      <a class="pico-link" href="{{ pico_url }}" target="_blank">&#8599; Pico Dashboard</a>
     </div>
   </header>
 
-  <!-- Status hero -->
+  <!-- ── Status Hero ── -->
   <div class="status-hero">
     <div>
-      <div class="status-label">&#9679; Device Status</div>
+      <div class="status-label">&#9679; Electricity Status</div>
       <div class="status-value {{ status_class }}" id="status-value">{{ status_text }}</div>
       <div class="status-meta" id="status-meta">{{ status_meta }}</div>
       <div class="status-meta" style="margin-top:.5rem">
-        <span style="color:var(--muted)">Last offline: </span>
+        <span style="color:var(--muted)">Last outage: </span>
         <span id="last-offline" style="color:var(--text)">{{ last_offline }}</span>
       </div>
       <div class="status-meta" style="margin-top:.3rem">
-        <span style="color:var(--muted)">Last seen: </span>
+        <span style="color:var(--muted)">Pico last seen: </span>
         <span id="last-seen" style="color:var(--text)">{{ last_seen }}</span>
       </div>
     </div>
     <div class="pulse {{ status_class }}" id="pulse-dot"></div>
   </div>
 
-  <!-- Stats -->
-  <div class="section-head">Downtime Statistics (REAL outages only)</div>
+  <!-- ── Recent Outage Events ── -->
+  <div class="section-head">Recent Outage Events (last 6)</div>
+  <div class="timeline" id="timeline-wrap">
+    <div class="tl-row tl-header" id="tl-header-row">
+      <div>Type</div>
+      <div>Started</div>
+      <div class="tl-col-end">Ended</div>
+      <div class="tl-col-dur">Duration</div>
+      <div></div>
+    </div>
+    {% if recent %}
+      {% for ev in recent %}
+      <div class="tl-row" data-idx="{{ ev.idx }}">
+        <div><span class="tl-badge {{ ev.type }}">{{ ev.type }}</span></div>
+        <div class="tl-time">{{ ev.start }}</div>
+        <div class="tl-time tl-col-end">{{ ev.end }}</div>
+        <div class="tl-dur tl-col-dur">{{ ev.duration }}</div>
+        <div><button class="tl-del-btn" onclick="askDelete({{ ev.idx }},'{{ ev.start }}','{{ ev.type }}')" title="Delete event">✕</button></div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="tl-empty" id="tl-empty">No outage events recorded yet.</div>
+    {% endif %}
+  </div>
+
+  <!-- ── Downtime Stats ── -->
+  <div class="section-head">Power Downtime Statistics (real outages only)</div>
   <div class="stats-grid">
     <div class="stat-card">
       <div class="period">Today</div>
@@ -678,11 +807,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Charts -->
-  <div class="section-head">Downtime Charts</div>
+  <!-- ── Outage Charts ── -->
+  <div class="section-head">Outage Charts</div>
 
   <div class="chart-card">
-    <div class="chart-title">Today — hourly breakdown (seconds offline)</div>
+    <div class="chart-title">
+      Today — hourly breakdown
+      <span class="chart-unit" id="unit-day">({{ chart_data.daily.unit }})</span>
+    </div>
     <div class="chart-wrap"><canvas id="chartDay"></canvas></div>
     <div class="legend">
       <div class="legend-item"><div class="legend-dot real"></div> Real outage</div>
@@ -691,7 +823,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="chart-card">
-    <div class="chart-title">Last 7 Days — daily breakdown (seconds offline)</div>
+    <div class="chart-title">
+      Last 7 Days — daily breakdown
+      <span class="chart-unit" id="unit-week">({{ chart_data.weekly.unit }})</span>
+    </div>
     <div class="chart-wrap"><canvas id="chartWeek"></canvas></div>
     <div class="legend">
       <div class="legend-item"><div class="legend-dot real"></div> Real outage</div>
@@ -700,7 +835,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="chart-card">
-    <div class="chart-title">This Month — daily breakdown (seconds offline)</div>
+    <div class="chart-title">
+      This Month — daily breakdown
+      <span class="chart-unit" id="unit-month">({{ chart_data.monthly.unit }})</span>
+    </div>
     <div class="chart-wrap"><canvas id="chartMonth"></canvas></div>
     <div class="legend">
       <div class="legend-item"><div class="legend-dot real"></div> Real outage</div>
@@ -708,87 +846,202 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <footer>power_monitor.py &nbsp;·&nbsp; device: {{ device_id }} &nbsp;·&nbsp; auto-refresh every 10 s</footer>
+  <!-- ── Footer ── -->
+  <footer>
+    <div>electricity_monitor.py &nbsp;·&nbsp; location: {{ device_id }} &nbsp;·&nbsp; auto-refresh every 10s</div>
+    <button class="test-tg-btn" id="test-tg-btn" onclick="sendTestTelegram()">
+      📨 Send test Telegram message
+    </button>
+  </footer>
 </div>
 
+<!-- ── Delete Confirm Modal ── -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <h3>⚠ Delete outage event?</h3>
+    <p id="modal-body">This will permanently remove the event from the log file. This action cannot be undone.</p>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+      <button class="btn-delete" id="modal-confirm-btn">Yes, delete it</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Toast ── -->
+<div id="toast"></div>
+
 <script>
-Chart.defaults.color = '#4a5568';
-Chart.defaults.font.family = "'JetBrains Mono', monospace";
-Chart.defaults.font.size   = 10;
+// ── Chart setup ───────────────────────────────────────────────────────────────
+Chart.defaults.color        = '#4a5568';
+Chart.defaults.font.family  = "'JetBrains Mono', monospace";
+Chart.defaults.font.size    = 10;
 
 const RED   = 'rgba(248,113,113,0.85)';
 const AMBER = 'rgba(251,191,36,0.75)';
 const RED_B = 'rgba(248,113,113,1)';
 const AMB_B = 'rgba(251,191,36,1)';
 
-function makeChart(id, labels, real, sim) {
+function buildTooltipLabel(unit) {
+  return ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y} ${unit}`;
+}
+
+function makeChart(id, data) {
   return new Chart(document.getElementById(id), {
     type: 'bar',
     data: {
-      labels,
+      labels: data.labels,
       datasets: [
-        { label: 'Real',      data: real, backgroundColor: RED,   borderColor: RED_B, borderWidth: 1, borderRadius: 3 },
-        { label: 'Simulated', data: sim,  backgroundColor: AMBER, borderColor: AMB_B, borderWidth: 1, borderRadius: 3 },
+        { label: 'Real',      data: data.real,      backgroundColor: RED,   borderColor: RED_B, borderWidth: 1, borderRadius: 3 },
+        { label: 'Simulated', data: data.simulated, backgroundColor: AMBER, borderColor: AMB_B, borderWidth: 1, borderRadius: 3 },
       ]
     },
     options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: buildTooltipLabel(data.unit) } }
+      },
       scales: {
         x: { stacked: true, grid: { color: '#1e2530' }, ticks: { maxRotation: 45, minRotation: 0 } },
-        y: { stacked: true, grid: { color: '#1e2530' }, beginAtZero: true,
-             ticks: { callback: v => v >= 3600 ? (v/3600).toFixed(1)+'h' : v >= 60 ? (v/60).toFixed(0)+'m' : v+'s' } }
+        y: {
+          stacked: true, grid: { color: '#1e2530' }, beginAtZero: true,
+          title: { display: true, text: data.unit, color: '#484f58', font: { size: 9 } }
+        }
       }
     }
   });
 }
 
 const initData   = {{ chart_data_json|safe }};
-const chartDay   = makeChart('chartDay',   initData.daily.labels,   initData.daily.real,   initData.daily.simulated);
-const chartWeek  = makeChart('chartWeek',  initData.weekly.labels,  initData.weekly.real,  initData.weekly.simulated);
-const chartMonth = makeChart('chartMonth', initData.monthly.labels, initData.monthly.real, initData.monthly.simulated);
+const chartDay   = makeChart('chartDay',   initData.daily);
+const chartWeek  = makeChart('chartWeek',  initData.weekly);
+const chartMonth = makeChart('chartMonth', initData.monthly);
 
-// ── Auto-refresh via /api/status ──────────────────────────────────────────
+// ── Auto-refresh ──────────────────────────────────────────────────────────────
 let countdown = 10;
 const counterEl = document.getElementById('refresh-counter');
 
-setInterval(function() {
+setInterval(() => {
   countdown--;
   counterEl.textContent = `refreshing in ${countdown}s`;
   if (countdown <= 0) { countdown = 10; fetchStatus(); }
 }, 1000);
 
-function updateChart(chart, data) {
+function updateChart(chart, unitEl, data) {
   chart.data.labels           = data.labels;
   chart.data.datasets[0].data = data.real;
   chart.data.datasets[1].data = data.simulated;
+  chart.options.plugins.tooltip.callbacks.label = buildTooltipLabel(data.unit);
+  chart.options.scales.y.title.text = data.unit;
   chart.update('none');
+  if (unitEl) unitEl.textContent = `(${data.unit})`;
 }
 
 function fetchStatus() {
   fetch('/api/status')
     .then(r => r.json())
     .then(d => {
-      const sv = document.getElementById('status-value');
-      const pd = document.getElementById('pulse-dot');
-      const sm = document.getElementById('status-meta');
-      sv.className   = 'status-value ' + d.status_class;
-      sv.textContent = d.status_text;
-      pd.className   = 'pulse '        + d.status_class;
-      sm.textContent = d.status_meta;
+      document.getElementById('status-value').className   = 'status-value ' + d.status_class;
+      document.getElementById('status-value').textContent = d.status_text;
+      document.getElementById('pulse-dot').className      = 'pulse ' + d.status_class;
+      document.getElementById('status-meta').textContent  = d.status_meta;
       document.getElementById('last-offline').textContent = d.last_offline;
       document.getElementById('last-seen').textContent    = d.last_seen;
-
-      document.getElementById('day-dur').textContent   = d.day.human;
-      document.getElementById('week-dur').textContent  = d.week.human;
-      document.getElementById('month-dur').textContent = d.month.human;
-
-      updateChart(chartDay,   d.charts.daily);
-      updateChart(chartWeek,  d.charts.weekly);
-      updateChart(chartMonth, d.charts.monthly);
+      document.getElementById('day-dur').textContent      = d.day.human;
+      document.getElementById('week-dur').textContent     = d.week.human;
+      document.getElementById('month-dur').textContent    = d.month.human;
+      updateChart(chartDay,   document.getElementById('unit-day'),   d.charts.daily);
+      updateChart(chartWeek,  document.getElementById('unit-week'),  d.charts.weekly);
+      updateChart(chartMonth, document.getElementById('unit-month'), d.charts.monthly);
+      if (d.recent) renderTimeline(d.recent);
     })
     .catch(e => console.warn('Status fetch failed:', e));
+}
+
+// ── Timeline render ───────────────────────────────────────────────────────────
+function renderTimeline(events) {
+  const wrap   = document.getElementById('timeline-wrap');
+  const header = document.getElementById('tl-header-row');
+  wrap.innerHTML = '';
+  wrap.appendChild(header);
+  if (!events.length) {
+    const empty = document.createElement('div');
+    empty.id = 'tl-empty'; empty.className = 'tl-empty';
+    empty.textContent = 'No outage events recorded yet.';
+    wrap.appendChild(empty);
+    return;
+  }
+  events.forEach(ev => {
+    const row = document.createElement('div');
+    row.className = 'tl-row'; row.dataset.idx = ev.idx;
+    row.innerHTML =
+      `<div><span class="tl-badge ${ev.type}">${ev.type}</span></div>` +
+      `<div class="tl-time">${ev.start}</div>` +
+      `<div class="tl-time tl-col-end">${ev.end}</div>` +
+      `<div class="tl-dur tl-col-dur">${ev.duration}</div>` +
+      `<div><button class="tl-del-btn" onclick="askDelete(${ev.idx},'${ev.start.replace(/'/g,"\\'")}','${ev.type}')" title="Delete">✕</button></div>`;
+    wrap.appendChild(row);
+  });
+}
+
+// ── Delete modal ──────────────────────────────────────────────────────────────
+let pendingDeleteIdx = null;
+
+function askDelete(idx, startStr, type) {
+  pendingDeleteIdx = idx;
+  document.getElementById('modal-body').textContent =
+    `You are about to permanently delete the ${type.toLowerCase()} outage event starting at "${startStr}". This cannot be undone.`;
+  document.getElementById('modal-overlay').classList.add('open');
+  document.getElementById('modal-confirm-btn').onclick = confirmDelete;
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+  pendingDeleteIdx = null;
+}
+
+// Close on overlay background click
+document.getElementById('modal-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+
+function confirmDelete() {
+  if (pendingDeleteIdx === null) return;
+  const idx = pendingDeleteIdx;
+  closeModal();
+  fetch('/api/delete_event', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idx })
+  })
+  .then(r => r.json())
+  .then(d => {
+    showToast(d.ok ? '✓ Event deleted successfully' : '✗ ' + (d.error || 'Delete failed'));
+    if (d.ok) fetchStatus();
+  })
+  .catch(() => showToast('✗ Network error — please retry'));
+}
+
+// ── Test Telegram ─────────────────────────────────────────────────────────────
+function sendTestTelegram() {
+  const btn = document.getElementById('test-tg-btn');
+  btn.disabled = true;
+  btn.textContent = '📨 Sending…';
+  fetch('/api/test_telegram', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => showToast(d.ok ? '✓ Test message sent to Telegram' : '✗ ' + (d.error || 'Failed')))
+    .catch(() => showToast('✗ Network error'))
+    .finally(() => { btn.disabled = false; btn.textContent = '📨 Send test Telegram message'; });
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+let toastTimer = null;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
 }
 </script>
 </body>
@@ -796,12 +1049,16 @@ function fetchStatus() {
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  FLASK HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _last_offline_str(entries) -> str:
     real = [e for e in entries if e["type"] == "REAL"]
     if not real:
-        return "---"
+        return "No outages recorded"
     latest = max(real, key=lambda e: e["start"])
-    return latest["start"].strftime("%H:%M  %d-%m-%Y")
+    return latest["start"].strftime("%H:%M  %d %b %Y")
 
 
 def _last_seen_str() -> str:
@@ -809,7 +1066,7 @@ def _last_seen_str() -> str:
         ts = state["last_seen"]
     if ts == 0.0:
         return "never"
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S  %d-%m-%Y")
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S  %d %b %Y")
 
 
 def _build_status_context():
@@ -820,13 +1077,13 @@ def _build_status_context():
         fails = state["consecutive_fails"]
 
     if curr == "online":
-        sc, st, sm = "online", "ONLINE", "Device is reachable"
+        sc, st, sm = "online", "ELECTRICITY ON", "Power is available"
     elif curr == "offline":
-        sc, st = "offline", "OFFLINE"
+        sc, st = "offline", "ELECTRICITY OFF"
         if off_s:
-            sm = f"Down for {_fmt_duration(int(time.time() - off_s))}"
+            sm = f"Outage in progress · {_fmt_duration(int(time.time() - off_s))}"
         else:
-            sm = "Device is unreachable"
+            sm = "Power is unavailable"
         if fails:
             sm += f" ({fails} failed poll{'s' if fails != 1 else ''})"
     else:
@@ -834,6 +1091,10 @@ def _build_status_context():
 
     return entries, sc, st, sm
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FLASK ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def dashboard():
@@ -853,7 +1114,9 @@ def dashboard():
         day             = daily_stats(entries),
         week            = weekly_stats(entries),
         month           = monthly_stats(entries),
+        chart_data      = chart_data,
         chart_data_json = json.dumps(chart_data),
+        recent          = recent_events(entries, 6),
         device_id       = DEVICE_ID,
         pico_url        = CONFIG["pico_url"],
         poll_interval   = CONFIG["poll_interval"],
@@ -872,6 +1135,7 @@ def api_status():
         "day":          daily_stats(entries),
         "week":         weekly_stats(entries),
         "month":        monthly_stats(entries),
+        "recent":       recent_events(entries, 6),
         "charts": {
             "daily":   chart_daily(entries),
             "weekly":  chart_weekly(entries),
@@ -880,37 +1144,61 @@ def api_status():
     })
 
 
+@app.route("/api/delete_event", methods=["POST"])
+def api_delete_event():
+    data = request.get_json(silent=True) or {}
+    idx  = data.get("idx")
+    if idx is None:
+        return jsonify({"ok": False, "error": "Missing idx parameter"}), 400
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "idx must be an integer"}), 400
+    ok = delete_log_entry_by_idx(idx)
+    if not ok:
+        return jsonify({"ok": False, "error": "Event not found (may already have been deleted)"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/test_telegram", methods=["POST"])
+def api_test_telegram():
+    now_str = datetime.now().strftime("%H:%M:%S on %d %b %Y")
+    try:
+        send_telegram(
+            "🔔 <b>Test Message</b>\n"
+            f"Electricity Monitor is working correctly.\n"
+            f"Sent at <b>{now_str}</b>\n"
+            f"Location ID: <code>{DEVICE_ID}</code>"
+        )
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  STARTUP
+#  STARTUP & MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def restore_state():
     entries = parse_log_entries()
-    log.info(f"Loaded {len(entries)} log entries from {LOG_FILE}")
+    log.info(f"Loaded {len(entries)} outage log entries from {LOG_FILE}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     log.info("=" * 60)
-    log.info("Power Monitor (HTTP mode) starting up")
-    log.info(f"  Device:       {DEVICE_ID}")
-    log.info(f"  Pico URL:     {PICO_STATUS_URL}")
-    log.info(f"  Poll interval:{CONFIG['poll_interval']}s")
-    log.info(f"  Offline after:{CONFIG['offline_timeout']}s silence")
-    log.info(f"  Log:          {LOG_FILE}")
-    log.info(f"  Web UI:       http://{CONFIG['web_host']}:{CONFIG['web_port']}")
+    log.info("Electricity Uptime Monitor starting")
+    log.info(f"  Location ID:   {DEVICE_ID}")
+    log.info(f"  Pico URL:      {PICO_STATUS_URL}")
+    log.info(f"  Poll interval: {CONFIG['poll_interval']}s")
+    log.info(f"  Log file:      {LOG_FILE}")
+    log.info(f"  Web UI:        http://{CONFIG['web_host']}:{CONFIG['web_port']}")
     log.info("=" * 60)
 
     restore_state()
 
-    # HTTP poll thread
     t_poll = threading.Thread(target=poll_loop, daemon=True, name="http-poll")
     t_poll.start()
 
-    # Flask (runs on main thread)
     app.run(
         host         = CONFIG["web_host"],
         port         = CONFIG["web_port"],
