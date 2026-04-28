@@ -1,0 +1,10 @@
+# Secrets — never commit the real config
+config.ini
+ 
+# Log data
+power_log.txt
+ 
+# Python
+__pycache__/
+*.pyc
+.venv/
