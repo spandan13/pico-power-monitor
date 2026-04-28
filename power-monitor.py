@@ -308,11 +308,29 @@ def restore_state_from_log():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  DOWNTIME STATS  (closed entries only)
+#  DOWNTIME STATS  (closed + any ongoing REAL open entry)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _closed_real(entries):
-    return [e for e in entries if e["type"] == "REAL" and not e["open"]]
+def _real_entries_with_open(entries):
+    """
+    Return REAL entries suitable for stats.
+    Closed REAL entries are used as-is.
+    The active OPEN REAL entry (if any) is returned with end=now so its
+    elapsed time is counted in all stat windows.
+    """
+    now = datetime.now()
+    result = []
+    for e in entries:
+        if e["type"] != "REAL":
+            continue
+        if not e["open"]:
+            result.append(e)
+        else:
+            # Synthesise a virtual closed copy with end=now
+            synthetic = dict(e)
+            synthetic["end"] = now
+            result.append(synthetic)
+    return result
 
 
 def _total_seconds(entries, since: datetime, until: datetime) -> int:
@@ -330,7 +348,7 @@ def _total_seconds(entries, since: datetime, until: datetime) -> int:
 def daily_stats(entries):
     now   = datetime.now()
     since = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    secs  = _total_seconds(_closed_real(entries), since, now)
+    secs  = _total_seconds(_real_entries_with_open(entries), since, now)
     return {"seconds": secs, "human": _fmt_duration(secs),
             "percentage": round(secs / 86400 * 100, 2)}
 
@@ -338,7 +356,7 @@ def daily_stats(entries):
 def weekly_stats(entries):
     now   = datetime.now()
     since = now - timedelta(days=7)
-    secs  = _total_seconds(_closed_real(entries), since, now)
+    secs  = _total_seconds(_real_entries_with_open(entries), since, now)
     return {"seconds": secs, "human": _fmt_duration(secs),
             "percentage": round(secs / (7 * 86400) * 100, 2)}
 
@@ -346,7 +364,7 @@ def weekly_stats(entries):
 def monthly_stats(entries):
     now    = datetime.now()
     since  = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    secs   = _total_seconds(_closed_real(entries), since, now)
+    secs   = _total_seconds(_real_entries_with_open(entries), since, now)
     window = (now - since).total_seconds()
     return {"seconds": secs, "human": _fmt_duration(secs),
             "percentage": round(secs / window * 100, 2) if window > 0 else 0}
@@ -655,6 +673,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Electricity Uptime Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230d1117'/%3E%3Cpolygon points='19,3 9,18 15,18 13,29 23,14 17,14' fill='%2338bdf8'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -782,7 +801,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .tl-badge.REAL      { background: rgba(248,113,113,.15); color: var(--red);   border: 1px solid rgba(248,113,113,.25); }
   .tl-badge.SIMULATED { background: rgba(251,191,36,.12);  color: var(--amber); border: 1px solid rgba(251,191,36,.2); }
-  .tl-badge.OPEN      { background: rgba(251,191,36,.2);   color: var(--amber); border: 1px solid var(--amber); animation: blink 1.4s infinite; }
+  .tl-badge.OPEN      { background: rgba(52,211,153,.15);  color: var(--green); border: 1px solid rgba(52,211,153,.5); animation: blink 1.4s infinite; }
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.45} }
   .tl-time  { font-family: var(--mono); color: var(--text); font-size: .72rem; }
   .tl-dur   { font-family: var(--mono); color: var(--muted); font-size: .72rem; }
@@ -1565,6 +1584,25 @@ def api_update_event():
         return jsonify({"ok": False, "error": "type must be REAL or SIMULATED"}), 400
     if not update_log_entry(idx, etype, start, end, status):
         return jsonify({"ok": False, "error": "Update failed – bad index or timestamps"}), 400
+
+    # If this is the currently-tracked open entry, sync in-memory state so
+    # the "Outage in progress" timer and downtime stats update immediately
+    # without needing a restart.
+    with state_lock:
+        if state["open_line_idx"] == idx:
+            if status == "OPEN":
+                try:
+                    state["offline_since"] = datetime.fromisoformat(start).timestamp()
+                    state["is_simulated"]  = (etype == "SIMULATED")
+                except Exception:
+                    pass
+            else:
+                # Entry was closed via edit — clear the live outage state
+                state["offline_since"]  = None
+                state["open_line_idx"]  = None
+                state["is_simulated"]   = False
+                state["current_status"] = "online"
+
     return jsonify({"ok": True})
 
 
