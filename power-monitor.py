@@ -494,6 +494,33 @@ def _get_bot():
     return _tg_bot
 
 
+def _tg_msg(header: str, rows: list, footer: str = "") -> str:
+    """
+    Build a monospace Telegram message rendered inside a <pre> block.
+
+    header : emoji + label, e.g. "⚠️ POWER OUTAGE"
+    rows   : list of (key, value) tuples for the detail section
+    footer : optional text shown below the closing divider
+    """
+    BOX = "\u2550" * 20          # ═══…
+    DIV = "\u2501" * 22          # ━━━…
+    top = f"\u2554{BOX}\u2557"   # ╔═══╗
+    bot = f"\u255a{BOX}\u255d"   # ╚═══╝
+
+    # 4-space indent
+    hdr = f"    {header}"
+
+    # Align colons: pad all keys to the same width
+    max_k = max((len(k) for k, _ in rows), default=0)
+    detail = [f"{k.ljust(max_k)}  :  {v}" for k, v in rows]
+
+    parts = [top, hdr, bot, DIV] + detail + [DIV]
+    if footer:
+        parts.append(footer)
+
+    return "<pre>" + "\n".join(parts) + "</pre>"
+
+
 def send_telegram(text: str):
     bot = _get_bot()
     if bot is None:
@@ -530,22 +557,24 @@ def handle_went_offline(simulated: bool):
     with state_lock:
         state["open_line_idx"] = open_line
 
-    now_str = datetime.fromtimestamp(start_ts).strftime("%H:%M on %d %b %Y")
+    dt = datetime.fromtimestamp(start_ts)
+    t_str = dt.strftime("%H:%M")
+    d_str = dt.strftime("%d %b %Y")
 
     if simulated:
         log.info("Electricity OFFLINE [SIMULATED]")
-        send_telegram(
-            "🔌 <b>Simulated Power Cut Active</b>\n"
-            f"Triggered at <b>{now_str}</b>.\n"
-            "Monitor will report <i>offline</i> until simulation is cancelled."
-        )
+        send_telegram(_tg_msg(
+            "🔌 SIM POWER CUT",
+            [("Status",  "SIMULATED"), ("Started", t_str), ("Date", d_str)],
+            footer="\u23f3 Monitoring...",
+        ))
     else:
         log.info("Electricity OFFLINE [REAL]")
-        send_telegram(
-            "⚠️ <b>Power Outage Detected</b>\n"
-            f"Electricity went offline at <b>{now_str}</b>.\n"
-            "You will be notified when power is restored."
-        )
+        send_telegram(_tg_msg(
+            "\u26a0\ufe0f POWER OUTAGE",
+            [("Status",  "OFFLINE"), ("Started", t_str), ("Date", d_str)],
+            footer="\u23f3 Monitoring...",
+        ))
 
 
 def handle_came_online():
@@ -574,26 +603,33 @@ def handle_came_online():
     if open_line_idx is not None:
         close_open_entry(open_line_idx, end_ts)
 
-    now_str = datetime.fromtimestamp(end_ts).strftime("%H:%M on %d %b %Y")
+    end_dt = datetime.fromtimestamp(end_ts)
+    t_str  = end_dt.strftime("%H:%M")
+    d_str  = end_dt.strftime("%d %b %Y")
 
     if simulated:
         log.info(f"Simulated outage ended ({_fmt_duration(duration)})")
-        send_telegram(
-            "✅ <b>Simulation Cancelled</b>\n"
-            f"Ended at <b>{now_str}</b>.\n"
-            f"Simulated duration: <b>{_fmt_duration(duration)}</b>.\n"
-            "Monitor is now reporting live electricity status."
-        )
+        send_telegram(_tg_msg(
+            "\u2705 SIM CANCELLED",
+            [("Status",   "ONLINE"),
+             ("Ended",    t_str),
+             ("Date",     d_str),
+             ("Duration", _fmt_duration(duration))],
+        ))
         return
 
     entries   = parse_log_entries()
     day_stats = daily_stats(entries)
-    send_telegram(
-        "✅ <b>Power Restored</b>\n"
-        f"Electricity came back at <b>{now_str}</b>.\n"
-        f"Outage duration: <b>{_fmt_duration(duration)}</b>\n"
-        f"Total downtime today: <b>{day_stats['human']}</b> ({day_stats['percentage']}%)"
-    )
+    send_telegram(_tg_msg(
+        "\u2705 POWER RESTORED",
+        [("Status",   "ONLINE"),
+         ("Restored", t_str),
+         ("Date",     d_str)],
+        footer=(
+            f"Duration  :  {_fmt_duration(duration)}\n"
+            f"Today     :  {day_stats['human']} ({day_stats['percentage']}%)"
+        ),
+    ))
     log.info(f"Electricity ONLINE – outage duration: {_fmt_duration(duration)}")
 
 
@@ -1624,14 +1660,18 @@ def api_add_event():
 
 @app.route("/api/test_telegram", methods=["POST"])
 def api_test_telegram():
-    now_str = datetime.now().strftime("%H:%M:%S on %d %b %Y")
+    now_dt  = datetime.now()
+    t_str   = now_dt.strftime("%H:%M")
+    d_str   = now_dt.strftime("%d %b %Y")
     try:
-        send_telegram(
-            "🔔 <b>Test Message</b>\n"
-            f"Electricity Monitor is working correctly.\n"
-            f"Sent at <b>{now_str}</b>\n"
-            f"Location ID: <code>{DEVICE_ID}</code>"
-        )
+        send_telegram(_tg_msg(
+            "\U0001f514 TEST MESSAGE",
+            [("Status",   "OK"),
+             ("Sent",     t_str),
+             ("Date",     d_str),
+             ("Location", DEVICE_ID)],
+            footer="Monitor is online \u2713",
+        ))
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
