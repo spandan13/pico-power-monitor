@@ -81,6 +81,9 @@ state = {
     "is_simulated":      False,
     "alert_sent":        False,
     "consecutive_fails": 0,
+    # Uptime streak: epoch float of when the last REAL outage ended (or script
+    # start time if no real outage has ever been recorded). Persisted via log.
+    "uptime_since":      None,
 }
 state_lock = threading.Lock()
 
@@ -265,9 +268,13 @@ def _fmt_duration(seconds: int) -> str:
         mins    = round(seconds / 60, 1)
         display = int(mins) if mins == int(mins) else mins
         return f"{display} minute{'s' if display != 1 else ''}"
-    hrs     = round(seconds / 3600, 2)
-    display = int(hrs) if hrs == int(hrs) else hrs
-    return f"{display} hour{'s' if display != 1 else ''}"
+    if seconds < 86400:
+        hrs     = round(seconds / 3600, 2)
+        display = int(hrs) if hrs == int(hrs) else hrs
+        return f"{display} hour{'s' if display != 1 else ''}"
+    days    = round(seconds / 86400, 1)
+    display = int(days) if days == int(days) else days
+    return f"{display} day{'s' if display != 1 else ''}"
 
 
 def _duration_unit(seconds: int) -> dict:
@@ -279,20 +286,95 @@ def _duration_unit(seconds: int) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  UPTIME STREAK HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_uptime_since(entries) -> float:
+    """
+    Find the timestamp from which the current uninterrupted uptime streak began.
+    This is the 'end' time of the most recent CLOSED REAL outage entry.
+    If there are no REAL outages on record, return the script start time.
+    """
+    real_closed = [
+        e for e in entries
+        if e["type"] == "REAL" and not e["open"] and e["end"] is not None
+    ]
+    if not real_closed:
+        return _script_start_time
+    latest = max(real_closed, key=lambda e: e["end"])
+    return latest["end"].timestamp()
+
+
+def _uptime_streak_str() -> str:
+    """Return a human-readable uptime streak string, e.g. '3 days 4 hours'."""
+    with state_lock:
+        since = state["uptime_since"]
+        curr  = state["current_status"]
+    # During a real outage there is no streak
+    if curr == "offline" and not state.get("is_simulated"):
+        return None
+    if since is None:
+        return None
+    secs = int(time.time() - since)
+    if secs < 0:
+        secs = 0
+    return _fmt_duration_streak(secs)
+
+
+def _fmt_duration_streak(seconds: int) -> str:
+    """
+    Human-readable streak with up to two components for readability.
+    e.g.  45s → "45 seconds"
+          90s → "1 minute 30 seconds"
+         2h5m → "2 hours 5 minutes"
+         1d3h → "1 day 3 hours"
+    """
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+    if seconds < 3600:
+        m = seconds // 60
+        s = seconds % 60
+        base = f"{m} minute{'s' if m != 1 else ''}"
+        return base + (f" {s} second{'s' if s != 1 else ''}" if s else "")
+    if seconds < 86400:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        base = f"{h} hour{'s' if h != 1 else ''}"
+        return base + (f" {m} minute{'s' if m != 1 else ''}" if m else "")
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
+    base = f"{d} day{'s' if d != 1 else ''}"
+    return base + (f" {h} hour{'s' if h != 1 else ''}" if h else "")
+
+
+# Script start time — used as streak origin when no real outage exists in log
+_script_start_time = time.time()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  STARTUP: RESTORE STATE FROM OPEN ENTRIES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def restore_state_from_log():
     """
     On startup, scan for any OPEN entry and re-hydrate in-memory state.
-    This means a server restart during an outage does NOT lose the start time.
+    Also compute the uptime streak start from the log.
     """
     entries = parse_log_entries()
     log.info(f"Loaded {len(entries)} log entries from {LOG_FILE}")
+
+    # ── Restore uptime streak ──────────────────────────────────────────────
+    uptime_since = _compute_uptime_since(entries)
+    with state_lock:
+        state["uptime_since"] = uptime_since
+    log.info(
+        f"Uptime streak started: {datetime.fromtimestamp(uptime_since).strftime(ISO_FMT)}"
+    )
+
+    # ── Restore active outage ──────────────────────────────────────────────
     open_entries = [e for e in entries if e["open"]]
     if not open_entries:
         return
-    # Use the most recent OPEN entry (should only ever be one)
     oe = max(open_entries, key=lambda e: e["start"])
     offline_ts = oe["start"].timestamp()
     is_sim     = (oe["type"] == "SIMULATED")
@@ -301,6 +383,9 @@ def restore_state_from_log():
         state["open_line_idx"]  = oe["idx"]
         state["is_simulated"]   = is_sim
         state["current_status"] = "offline"
+        # During a real outage the streak is paused — set uptime_since to None
+        if not is_sim:
+            state["uptime_since"] = None
     log.info(
         f"Resumed {'simulated ' if is_sim else ''}outage from log "
         f"(started {oe['start'].strftime(ISO_FMT)}, line {oe['idx']})"
@@ -312,12 +397,6 @@ def restore_state_from_log():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _real_entries_with_open(entries):
-    """
-    Return REAL entries suitable for stats.
-    Closed REAL entries are used as-is.
-    The active OPEN REAL entry (if any) is returned with end=now so its
-    elapsed time is counted in all stat windows.
-    """
     now = datetime.now()
     result = []
     for e in entries:
@@ -326,7 +405,6 @@ def _real_entries_with_open(entries):
         if not e["open"]:
             result.append(e)
         else:
-            # Synthesise a virtual closed copy with end=now
             synthetic = dict(e)
             synthetic["end"] = now
             result.append(synthetic)
@@ -495,29 +573,16 @@ def _get_bot():
 
 
 def _tg_msg(header: str, rows: list, footer: str = "") -> str:
-    """
-    Build a monospace Telegram message rendered inside a <pre> block.
-
-    header : emoji + label, e.g. "⚠️ POWER OUTAGE"
-    rows   : list of (key, value) tuples for the detail section
-    footer : optional text shown below the closing divider
-    """
-    BOX = "\u2550" * 20          # ═══…
-    DIV = "\u2501" * 22          # ━━━…
-    top = f"\u2554{BOX}\u2557"   # ╔═══╗
-    bot = f"\u255a{BOX}\u255d"   # ╚═══╝
-
-    # 4-space indent
+    BOX = "\u2550" * 20
+    DIV = "\u2501" * 22
+    top = f"\u2554{BOX}\u2557"
+    bot = f"\u255a{BOX}\u255d"
     hdr = f"    {header}"
-
-    # Align colons: pad all keys to the same width
     max_k = max((len(k) for k, _ in rows), default=0)
     detail = [f"{k.ljust(max_k)}  :  {v}" for k, v in rows]
-
     parts = [top, hdr, bot, DIV] + detail + [DIV]
     if footer:
         parts.append(footer)
-
     return "<pre>" + "\n".join(parts) + "</pre>"
 
 
@@ -544,13 +609,15 @@ def send_telegram(text: str):
 def handle_went_offline(simulated: bool):
     with state_lock:
         if state["offline_since"] is not None:
-            return                              # already tracking an outage
+            return
         start_ts              = time.time()
         state["offline_since"] = start_ts
         state["is_simulated"]  = simulated
         state["alert_sent"]    = False
+        # Pause streak only for real outages
+        if not simulated:
+            state["uptime_since"] = None
 
-    # Write to log file immediately
     evt_type     = "SIMULATED" if simulated else "REAL"
     open_line    = log_open_entry(evt_type, start_ts)
 
@@ -594,14 +661,18 @@ def handle_came_online():
 
     if duration < 10:
         log.info(f"Ignoring sub-10s blip ({duration}s)")
-        # Still close the open entry so it doesn't linger
         if open_line_idx is not None:
             close_open_entry(open_line_idx, end_ts)
         return
 
-    # Close the open log entry that was written when the outage started
     if open_line_idx is not None:
         close_open_entry(open_line_idx, end_ts)
+
+    # Reset the uptime streak for real outages (simulated outages don't break streak)
+    if not simulated:
+        with state_lock:
+            state["uptime_since"] = end_ts
+        log.info(f"Uptime streak reset — new streak started at {datetime.fromtimestamp(end_ts).strftime(ISO_FMT)}")
 
     end_dt = datetime.fromtimestamp(end_ts)
     t_str  = end_dt.strftime("%H:%M")
@@ -627,7 +698,7 @@ def handle_came_online():
          ("Date",     d_str)],
         footer=(
             f"Duration  :  {_fmt_duration(duration)}\n"
-            f"Today     :  {day_stats['human']} ({day_stats['percentage']}%)"
+            f"Today     :  {day_stats['human']}"
         ),
     ))
     log.info(f"Electricity ONLINE – outage duration: {_fmt_duration(duration)}")
@@ -671,6 +742,9 @@ def poll_loop():
                 state["last_seen"]         = now
                 state["consecutive_fails"] = 0
                 state["current_status"]    = "online"
+                # First time we see "online" and uptime_since is unset, seed it now
+                if state["uptime_since"] is None and state["offline_since"] is None:
+                    state["uptime_since"] = now
             if prev_status != "online":
                 handle_came_online()
 
@@ -769,8 +843,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* ── Status hero ── */
   .status-hero {
     background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 1.6rem 1.8rem; display: flex; align-items: center;
-    justify-content: space-between; flex-wrap: wrap; gap: 1rem;
+    padding: 1.6rem 1.8rem; display: flex; align-items: flex-start;
+    justify-content: space-between; gap: 1rem;
     margin-bottom: 1.5rem; position: relative; overflow: hidden;
   }
   .status-hero::before {
@@ -784,6 +858,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .status-value.offline { color: var(--red); }
   .status-value.unknown { color: var(--muted); }
   .status-meta { font-family: var(--mono); font-size: .75rem; color: var(--muted); margin-top: .3rem; }
+
+  /* ── Uptime streak ── */
+  .uptime-streak {
+    display: flex; align-items: center; gap: .5rem;
+    margin-top: .65rem; margin-bottom: .1rem; flex-wrap: nowrap;
+    max-width: 100%; white-space: nowrap;
+    background: rgba(52,211,153,.08);
+    border: 1px solid rgba(52,211,153,.22);
+    border-radius: 6px; padding: .32rem .75rem;
+    font-family: var(--mono); font-size: .82rem;
+    color: var(--green); font-weight: 600;
+    letter-spacing: .01em; overflow: hidden;
+    transition: opacity .3s;
+  }
+  .uptime-streak.hidden { display: none; }
+  .streak-icon { font-size: .9rem; }
+  .streak-label { color: rgba(52,211,153,.6); font-weight: 400; margin-right: .1rem; }
+
   .pulse { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
   .pulse.online  { background: var(--green); animation: pulse-g 2s infinite; }
   .pulse.offline { background: var(--red);   animation: pulse-r 2s infinite; }
@@ -960,7 +1052,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   @media (max-width: 600px) {
     .tl-row { grid-template-columns: 80px 1fr 64px; }
     .tl-col-end, .tl-col-dur { display: none; }
-    .status-value { font-size: 1.4rem; }
+    .status-hero { padding: 1.2rem 1.1rem; }
+    .status-value { font-size: 1.25rem; }
+    .uptime-streak { font-size: .74rem; padding: .28rem .55rem; }
+    .status-hero > .pulse { margin-top: .15rem; }
     .chart-wrap   { height: 150px; }
     .form-row, .form-row-3 { grid-template-columns: 1fr; }
   }
@@ -983,11 +1078,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <!-- Status Hero -->
   <div class="status-hero">
-    <div>
+    <div style="min-width:0;flex:1">
       <div class="status-label">&#9679; Electricity Status</div>
       <div class="status-value {{ status_class }}" id="status-value">{{ status_text }}</div>
-      <div class="status-meta" id="status-meta">{{ status_meta }}</div>
-      <div class="status-meta" style="margin-top:.5rem">
+
+      <!-- Uptime streak badge — shown only when online, resets on real outages -->
+      <div class="uptime-streak{% if not uptime_streak %} hidden{% endif %}" id="uptime-streak">
+        <span class="streak-icon">⚡</span>
+        <span class="streak-label">Connected&nbsp;for</span>
+        <span id="streak-duration" style="font-weight:700">{{ uptime_streak or '' }}</span>
+      </div>
+
+      <div class="status-meta" id="status-meta" style="margin-top:.55rem">{{ status_meta }}</div>
+      <div class="status-meta" style="margin-top:.3rem">
         <span style="color:var(--muted)">Last outage: </span>
         <span id="last-offline" style="color:var(--text)">{{ last_offline }}</span>
       </div>
@@ -1223,6 +1326,42 @@ const chartDay   = makeChart('chartDay',   initData.daily);
 const chartWeek  = makeChart('chartWeek',  initData.weekly);
 const chartMonth = makeChart('chartMonth', initData.monthly);
 
+// ── Uptime streak client-side ticker ─────────────────────────────────────────
+// We get uptime_since_epoch from the server and tick locally every second
+// so the "Connected for X" updates smoothly without waiting for the 10s poll.
+let uptimeSinceEpoch = {{ uptime_since_epoch|default(0) }};
+
+function fmtStreakClient(secs) {
+  if (secs < 0) secs = 0;
+  if (secs < 60) return secs + ' second' + (secs !== 1 ? 's' : '');
+  if (secs < 3600) {
+    const m = Math.floor(secs / 60), s = secs % 60;
+    return m + ' minute' + (m !== 1 ? 's' : '') + (s ? ' ' + s + ' second' + (s !== 1 ? 's' : '') : '');
+  }
+  if (secs < 86400) {
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+    return h + ' hour' + (h !== 1 ? 's' : '') + (m ? ' ' + m + ' minute' + (m !== 1 ? 's' : '') : '');
+  }
+  const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600);
+  return d + ' day' + (d !== 1 ? 's' : '') + (h ? ' ' + h + ' hour' + (h !== 1 ? 's' : '') : '');
+}
+
+function tickStreak() {
+  const badge = document.getElementById('uptime-streak');
+  const dur   = document.getElementById('streak-duration');
+  if (!badge || !dur) return;
+  if (uptimeSinceEpoch <= 0) {
+    badge.classList.add('hidden');
+    return;
+  }
+  const secs = Math.floor(Date.now() / 1000 - uptimeSinceEpoch);
+  badge.classList.remove('hidden');
+  dur.textContent = fmtStreakClient(secs);
+}
+
+setInterval(tickStreak, 1000);
+tickStreak();
+
 // ── Auto-refresh ──────────────────────────────────────────────────────────────
 let countdown = 10;
 const counterEl = document.getElementById('refresh-counter');
@@ -1257,6 +1396,10 @@ function fetchStatus() {
     updateChart(chartWeek,  document.getElementById('unit-week'),  d.charts.weekly);
     updateChart(chartMonth, document.getElementById('unit-month'), d.charts.monthly);
     if (d.recent) renderTimeline(d.recent);
+
+    // Sync streak epoch from server so restarts / manual edits are picked up
+    uptimeSinceEpoch = d.uptime_since_epoch || 0;
+    tickStreak();
   }).catch(e=>console.warn('fetch failed',e));
 }
 
@@ -1331,7 +1474,6 @@ function buildHoursMinutes(sH, sM, eH, eM) {
   fillSelect('e-min',  mins,  eM !== undefined ? eM : 0);
 }
 
-// parse "2025-06-15T14:30:00" → {year,month,day,hour,min}
 function parseISO(iso) {
   if (!iso || iso === '-') return null;
   const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
@@ -1541,6 +1683,19 @@ def _build_status_context():
     return entries, sc, st, sm
 
 
+def _get_uptime_since_epoch() -> float:
+    """Return the epoch timestamp for streak start, or 0 if no streak active."""
+    with state_lock:
+        curr  = state["current_status"]
+        since = state["uptime_since"]
+        is_sim = state["is_simulated"]
+        offline = state["offline_since"]
+    # Hide streak during a real (non-simulated) outage
+    if curr == "offline" and offline is not None and not is_sim:
+        return 0
+    return since if since else 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  FLASK ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1553,38 +1708,44 @@ def dashboard():
         "weekly":  chart_weekly(entries),
         "monthly": chart_monthly(entries),
     }
+    uptime_epoch  = _get_uptime_since_epoch()
+    uptime_streak = _uptime_streak_str() if uptime_epoch > 0 else None
     return render_template_string(
         DASHBOARD_HTML,
-        status_class    = sc,
-        status_text     = st,
-        status_meta     = sm,
-        last_offline    = _last_offline_str(entries),
-        last_seen       = _last_seen_str(),
-        day             = daily_stats(entries),
-        week            = weekly_stats(entries),
-        month           = monthly_stats(entries),
-        chart_data      = chart_data,
-        chart_data_json = json.dumps(chart_data),
-        recent          = recent_events(entries, 6),
-        device_id       = DEVICE_ID,
-        pico_url        = CONFIG["pico_url"],
-        poll_interval   = CONFIG["poll_interval"],
+        status_class      = sc,
+        status_text       = st,
+        status_meta       = sm,
+        last_offline      = _last_offline_str(entries),
+        last_seen         = _last_seen_str(),
+        day               = daily_stats(entries),
+        week              = weekly_stats(entries),
+        month             = monthly_stats(entries),
+        chart_data        = chart_data,
+        chart_data_json   = json.dumps(chart_data),
+        recent            = recent_events(entries, 6),
+        device_id         = DEVICE_ID,
+        pico_url          = CONFIG["pico_url"],
+        poll_interval     = CONFIG["poll_interval"],
+        uptime_streak     = uptime_streak,
+        uptime_since_epoch= uptime_epoch,
     )
 
 
 @app.route("/api/status")
 def api_status():
     entries, sc, st, sm = _build_status_context()
+    uptime_epoch = _get_uptime_since_epoch()
     return jsonify({
-        "status_class": sc,
-        "status_text":  st,
-        "status_meta":  sm,
-        "last_offline": _last_offline_str(entries),
-        "last_seen":    _last_seen_str(),
-        "day":          daily_stats(entries),
-        "week":         weekly_stats(entries),
-        "month":        monthly_stats(entries),
-        "recent":       recent_events(entries, 6),
+        "status_class":      sc,
+        "status_text":       st,
+        "status_meta":       sm,
+        "last_offline":      _last_offline_str(entries),
+        "last_seen":         _last_seen_str(),
+        "day":               daily_stats(entries),
+        "week":              weekly_stats(entries),
+        "month":             monthly_stats(entries),
+        "recent":            recent_events(entries, 6),
+        "uptime_since_epoch": uptime_epoch,
         "charts": {
             "daily":   chart_daily(entries),
             "weekly":  chart_weekly(entries),
@@ -1602,6 +1763,11 @@ def api_delete_event():
         return jsonify({"ok": False, "error": "Invalid or missing idx"}), 400
     if not delete_log_entry_by_idx(idx):
         return jsonify({"ok": False, "error": "Entry not found"}), 404
+    # Recompute uptime streak since log changed
+    entries = parse_log_entries()
+    new_since = _compute_uptime_since(entries)
+    with state_lock:
+        state["uptime_since"] = new_since
     return jsonify({"ok": True})
 
 
@@ -1621,9 +1787,6 @@ def api_update_event():
     if not update_log_entry(idx, etype, start, end, status):
         return jsonify({"ok": False, "error": "Update failed – bad index or timestamps"}), 400
 
-    # If this is the currently-tracked open entry, sync in-memory state so
-    # the "Outage in progress" timer and downtime stats update immediately
-    # without needing a restart.
     with state_lock:
         if state["open_line_idx"] == idx:
             if status == "OPEN":
@@ -1633,11 +1796,16 @@ def api_update_event():
                 except Exception:
                     pass
             else:
-                # Entry was closed via edit — clear the live outage state
                 state["offline_since"]  = None
                 state["open_line_idx"]  = None
                 state["is_simulated"]   = False
                 state["current_status"] = "online"
+
+    # Recompute uptime streak since log changed
+    entries = parse_log_entries()
+    new_since = _compute_uptime_since(entries)
+    with state_lock:
+        state["uptime_since"] = new_since
 
     return jsonify({"ok": True})
 
@@ -1655,6 +1823,11 @@ def api_add_event():
         return jsonify({"ok": False, "error": "type must be REAL or SIMULATED"}), 400
     if not add_log_entry(etype, start, end):
         return jsonify({"ok": False, "error": "Add failed – check timestamps"}), 400
+    # Recompute uptime streak since log changed
+    entries = parse_log_entries()
+    new_since = _compute_uptime_since(entries)
+    with state_lock:
+        state["uptime_since"] = new_since
     return jsonify({"ok": True})
 
 
